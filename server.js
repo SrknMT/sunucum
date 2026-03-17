@@ -7,26 +7,64 @@ app.use(cors());
 app.use(express.json());
 
 // ====================================================
-// MERKEZİ İSTİHBARAT SİSTEMİ (Önbellek / Cache)
+// MERKEZİ İSTİHBARAT SİSTEMİ (Önbellek & Tarihçe Kaptanı)
 // ====================================================
-let globalMarketData = null;
+let globalMarketData = null; // Arayüzün çökmemesi için orijinal veriyi tuttuğumuz yer
+let marketLedger = {};       // 7/24 Fiyat ve Stok Geçmişini arşivleyen gizli kasamız
 let lastUpdate = "Henüz güncellenmedi";
 
 async function updateMarketData() {
     try {
-        console.log("Market verileri Mixyero'dan çekiliyor...");
+        console.log("📡 Market verileri Mixyero'dan çekiliyor...");
         const response = await fetch("https://mixyero.online/api_market_data.php", {
             headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
         });
         
         if (!response.ok) throw new Error("Market API yanıt vermedi.");
         
-        const data = await response.text();
-        // Veriyi sunucunun RAM'ine alıyoruz
-        globalMarketData = JSON.parse(data);
-        lastUpdate = new Date().toLocaleTimeString('tr-TR');
+        const dataText = await response.text();
+        const dataJson = JSON.parse(dataText);
         
-        console.log(`[BAŞARILI] Piyasa güncellendi! Saat: ${lastUpdate}`);
+        globalMarketData = dataJson; // Eski sistem için ham veriyi sakla
+        
+        // --- 7/24 TARİHÇE (GRAFİK) KAYIT İŞLEMİ ---
+        const now = Date.now();
+        let itemsList = Array.isArray(dataJson.data) ? dataJson.data : (Array.isArray(dataJson) ? dataJson : Object.values(dataJson.data || dataJson));
+
+        itemsList.forEach(apiItem => {
+            let name = apiItem.item || apiItem.name || apiItem.id;
+            if (!name) return;
+            
+            let price = apiItem.price || apiItem.avgPrice || apiItem.minPrice || 0;
+            let supply = apiItem.supply || apiItem.volume || apiItem.stock || apiItem.quantity || 0;
+
+            // Ürün kasada yoksa sıfırdan oluştur
+            if (!marketLedger[name]) {
+                marketLedger[name] = { price: price, oldPrice: price, supply: supply, oldSupply: supply, history: [] };
+            }
+
+            let current = marketLedger[name];
+            
+            // Fiyat veya stok değişmişse eski veriyi oldPrice/oldSupply'a kaydır, yenisini yaz
+            if (current.price !== price || current.supply !== supply) {
+                current.oldPrice = current.price;
+                current.oldSupply = current.supply;
+                current.price = price;
+                current.supply = supply;
+            }
+            
+            // Grafiğin kesintisiz çizilmesi için o anki fiyatı zamana damgalayıp arşive at
+            current.history.push({ t: now, p: price });
+            
+            // Sunucunun RAM'i dolup çökmesin diye sadece son 50 fiyat hareketini (yaklaşık 12 saatlik kesintisiz grafik) tutuyoruz
+            if (current.history.length > 50) {
+                current.history.shift();
+            }
+        });
+
+        lastUpdate = new Date().toLocaleTimeString('tr-TR');
+        console.log(`[BAŞARILI] Piyasa güncellendi ve arşive işlendi! Saat: ${lastUpdate}`);
+        
     } catch (err) {
         console.error("[HATA] Arka plan market güncellemesi başarısız:", err.message);
     }
@@ -35,8 +73,15 @@ async function updateMarketData() {
 // Sunucu başlar başlamaz ilk veriyi çek
 updateMarketData();
 
-// Her 30 dakikada bir veriyi otomatik yenile (Limitlere takılmamak için)
-setInterval(updateMarketData, 30 * 60 * 1000);
+// Her 15 dakikada bir veriyi otomatik yenile (Limitlere takılmamak ve uyumamak için)
+setInterval(updateMarketData, 15 * 60 * 1000);
+
+// ----------------------------------------------------
+// 0. UPTIME PING KAPISI (Sunucuyu 7/24 Uyanık Tutar)
+// ----------------------------------------------------
+app.get("/ping", (req, res) => {
+    res.status(200).send("PONG - Sunucu ayakta ve çalışıyor!");
+});
 
 // ----------------------------------------------------
 // 1. ESKİ UYGULAMANI BOZMAYAN MARKET API'Sİ
@@ -45,14 +90,13 @@ app.get("/market", (req, res) => {
     if (!globalMarketData) {
         return res.status(503).json({ error: "Market verileri hazırlanıyor..." });
     }
-    // DİKKAT: Eski uygulaman nasıl bekliyorsa veriyi TIPA TIP aynı formatta gönderiyoruz!
-    // Sadece Mixyero'dan değil, bizim hızlı RAM'imizden gidiyor.
+    // Eski uygulamanın bozulmaması için orijinal ham veriyi gönderiyoruz
     res.json(globalMarketData);
 });
 
-// (Yeni Radar ve İstihbarat için ekstra bir kapı açtık, eskisini ellemedik)
+// YENİ: Oyuna girmesen bile biriken 7/24 grafik ve stok verisini sunan kapı
 app.get("/api/istihbarat", (req, res) => {
-    res.json({ lastUpdate: lastUpdate, data: globalMarketData });
+    res.json({ lastUpdate: lastUpdate, ledger: marketLedger });
 });
 
 // ----------------------------------------------------
